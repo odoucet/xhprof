@@ -28,7 +28,7 @@
 #include "php_ini.h"
 #include "ext/standard/info.h"
 #include "php_xhprof.h"
-#include "Zend/zend_extensions.h"
+#include "zend_extensions.h"
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <stdlib.h>
@@ -60,16 +60,6 @@
 #   define SET_AFFINITY(pid, size, mask)       \
         thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY, mask, \
                           THREAD_AFFINITY_POLICY_COUNT)
-#elif PHP_WIN32
-/*
- * Patch for compiling in Windows (i've used MS VC++ 6)
- * @author Benjamin Carl <opensource@clickalicious.de>
- */
-#    define CPU_SET(cpu_id, new_mask) (*(new_mask)) = (cpu_id + 1)
-#    define CPU_ZERO(new_mask) (*(new_mask)) = 0
-#    define SET_AFFINITY(pid, size, mask) SetProcessAffinityMask(pid, (*(mask)))
-#    define GET_AFFINITY(pid, size, mask) \
-                      GetProcessAffinityMask(GetCurrentProcess(), mask, &s_mask)
 #else
 /* For sched_getaffinity, sched_setaffinity */
 # include <sched.h>
@@ -86,7 +76,7 @@
  */
 
 /* XHProf version                           */
-#define XHPROF_VERSION       "0.10.0"
+#define XHPROF_VERSION       "0.9.2"
 
 /* Fictitious function name to represent top of the call tree. The paranthesis
  * in the name is to ensure we don't conflict with user function names.  */
@@ -109,7 +99,6 @@
 #define XHPROF_FLAGS_NO_BUILTINS   0x0001         /* do not profile builtins */
 #define XHPROF_FLAGS_CPU           0x0002      /* gather CPU times for funcs */
 #define XHPROF_FLAGS_MEMORY        0x0004   /* gather memory usage for funcs */
-#define XHPROF_FLAGS_LONGNAMES     0x0008   /* use long filenames in reports */
 
 /* Constants for XHPROF_MODE_SAMPLED        */
 #define XHPROF_SAMPLING_INTERVAL       100000      /* In microsecs        */
@@ -244,16 +233,28 @@ typedef struct hp_global_t {
 /* XHProf global state */
 static hp_global_t       hp_globals;
 
+#if PHP_VERSION_ID < 50500
 /* Pointer to the original execute function */
-ZEND_DLEXPORT void (*_zend_execute) (zend_op_array *ops TSRMLS_DC);
+static ZEND_DLEXPORT void (*_zend_execute) (zend_op_array *ops TSRMLS_DC);
 
 /* Pointer to the origianl execute_internal function */
-ZEND_DLEXPORT void (*_zend_execute_internal) (zend_execute_data *data,
+static ZEND_DLEXPORT void (*_zend_execute_internal) (zend_execute_data *data,
                            int ret TSRMLS_DC);
+#else
+/* Pointer to the original execute function */
+static void (*_zend_execute_ex) (zend_execute_data *execute_data TSRMLS_DC);
+
+/* Pointer to the origianl execute_internal function */
+static void (*_zend_execute_internal) (zend_execute_data *data,
+                      struct _zend_fcall_info *fci, int ret TSRMLS_DC);
+#endif
 
 /* Pointer to the original compile function */
 static zend_op_array * (*_zend_compile_file) (zend_file_handle *file_handle,
                                               int type TSRMLS_DC);
+
+/* Pointer to the original compile string function (used by eval) */
+static zend_op_array * (*_zend_compile_string) (zval *source_string, char *filename TSRMLS_DC);
 
 /* Bloom filter for function names to be ignored */
 #define INDEX_2_BYTE(index)  (index >> 3)
@@ -292,8 +293,29 @@ static inline zval  *hp_zval_at_key(char  *key,
 static inline char **hp_strings_in_zval(zval  *values);
 static inline void   hp_array_del(char **name_array);
 
-static int restore_cpu_affinity(cpu_set_t * prev_mask);
-static int bind_to_cpu(uint32 cpu_id);
+/* {{{ arginfo */
+ZEND_BEGIN_ARG_INFO_EX(arginfo_xhprof_enable, 0, 0, 0)
+  ZEND_ARG_INFO(0, flags)
+  ZEND_ARG_INFO(0, options)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_xhprof_disable, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_xhprof_sample_enable, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_xhprof_sample_disable, 0)
+ZEND_END_ARG_INFO()
+/* }}} */
+
+/**
+ * *********************
+ * FUNCTION PROTOTYPES
+ * *********************
+ */
+int restore_cpu_affinity(cpu_set_t * prev_mask);
+int bind_to_cpu(uint32 cpu_id);
 
 /**
  * *********************
@@ -302,10 +324,10 @@ static int bind_to_cpu(uint32 cpu_id);
  */
 /* List of functions implemented/exposed by xhprof */
 zend_function_entry xhprof_functions[] = {
-  PHP_FE(xhprof_enable, NULL)
-  PHP_FE(xhprof_disable, NULL)
-  PHP_FE(xhprof_sample_enable, NULL)
-  PHP_FE(xhprof_sample_disable, NULL)
+  PHP_FE(xhprof_enable, arginfo_xhprof_enable)
+  PHP_FE(xhprof_disable, arginfo_xhprof_disable)
+  PHP_FE(xhprof_sample_enable, arginfo_xhprof_sample_enable)
+  PHP_FE(xhprof_sample_disable, arginfo_xhprof_sample_disable)
   {NULL, NULL, NULL}
 };
 
@@ -421,19 +443,13 @@ PHP_FUNCTION(xhprof_sample_disable) {
  */
 PHP_MINIT_FUNCTION(xhprof) {
   int i;
-  unsigned long s_mask;
 
   REGISTER_INI_ENTRIES();
 
   hp_register_constants(INIT_FUNC_ARGS_PASSTHRU);
 
   /* Get the number of available logical CPUs. */
-#ifndef PHP_WIN32
   hp_globals.cpu_num = sysconf(_SC_NPROCESSORS_CONF);
-#else
-  GetSystemInfo(&sysinfo);
-  hp_globals.cpu_num = sysinfo.dwNumberOfProcessors;
-#endif
 
   /* Get the cpu affinity mask. */
 #ifndef __APPLE__
@@ -504,23 +520,14 @@ PHP_MINFO_FUNCTION(xhprof)
 {
   char buf[SCRATCH_BUF_LEN];
   char tmp[SCRATCH_BUF_LEN];
-  /* Note(bcarl): changed to uint32 like defined in struct -> hp_global_t */
-  uint32 i;
+  int i;
   int len;
 
-  // duplicate call needed?
-  get_all_cpu_frequencies();
-
   php_info_print_table_start();
-  php_info_print_table_row(2, "xhprof", "enabled");
-  php_info_print_table_row(2, "xhprof version", XHPROF_VERSION);
+  php_info_print_table_header(2, "xhprof", XHPROF_VERSION);
   len = snprintf(buf, SCRATCH_BUF_LEN, "%d", hp_globals.cpu_num);
   buf[len] = 0;
-  php_info_print_table_row(2, "CPU num", buf);
-  /* information about the cpu the process is bound to */
-  len = snprintf(tmp, SCRATCH_BUF_LEN, " CPU %d ", hp_globals.cur_cpu_id);
-  tmp[len] = 0;
-  php_info_print_table_row(2, "process bound to", tmp);
+  php_info_print_table_header(2, "CPU num", buf);
 
   if (hp_globals.cpu_frequencies) {
     /* Print available cpu frequencies here. */
@@ -528,7 +535,7 @@ PHP_MINFO_FUNCTION(xhprof)
     for (i = 0; i < hp_globals.cpu_num; ++i) {
       len = snprintf(buf, SCRATCH_BUF_LEN, " CPU %d ", i);
       buf[len] = 0;
-      len = snprintf(tmp, SCRATCH_BUF_LEN, "%-.0f", hp_globals.cpu_frequencies[i]);
+      len = snprintf(tmp, SCRATCH_BUF_LEN, "%f", hp_globals.cpu_frequencies[i]);
       tmp[len] = 0;
       php_info_print_table_row(2, buf, tmp);
     }
@@ -555,10 +562,6 @@ static void hp_register_constants(INIT_FUNC_ARGS) {
 
   REGISTER_LONG_CONSTANT("XHPROF_FLAGS_MEMORY",
                          XHPROF_FLAGS_MEMORY,
-                         CONST_CS | CONST_PERSISTENT);
-
-  REGISTER_LONG_CONSTANT("XHPROF_FLAGS_LONGNAMES",
-                         XHPROF_FLAGS_LONGNAMES,
                          CONST_CS | CONST_PERSISTENT);
 }
 
@@ -593,6 +596,11 @@ static inline uint8 hp_inline_hash(char * str) {
  * @author mpal
  */
 static void hp_get_ignored_functions_from_arg(zval *args) {
+
+  if (hp_globals.ignored_function_names) {
+    hp_array_del(hp_globals.ignored_function_names);
+  }
+
   if (args != NULL) {
     zval  *zresult = NULL;
 
@@ -769,7 +777,6 @@ void hp_clean_profiler_state(TSRMLS_D) {
 size_t hp_get_entry_name(hp_entry_t  *entry,
                          char           *result_buf,
                          size_t          result_len) {
-  size_t    len = 0;
 
   /* Validate result_len */
   if (result_len <= 1) {
@@ -818,7 +825,7 @@ int  hp_ignore_entry_work(uint8 hash_code, char *curr_func) {
   return ignore;
 }
 
-inline int  hp_ignore_entry(uint8 hash_code, char *curr_func) {
+static inline int  hp_ignore_entry(uint8 hash_code, char *curr_func) {
   /* First check if ignoring functions is enabled */
   return hp_globals.ignored_function_names != NULL &&
          hp_ignore_entry_work(hash_code, curr_func);
@@ -887,17 +894,13 @@ size_t hp_get_function_stack(hp_entry_t *entry,
  * a pointer to one-level directory and basefile name
  * (d/foo.php) in the same string.
  */
-static char *hp_get_base_filename(char *filename) {
-  char *ptr;
+static const char *hp_get_base_filename(const char *filename) {
+  const char *ptr;
   int   found = 0;
-
 
   if (!filename)
     return "";
 
-  if(hp_globals.xhprof_flags & XHPROF_FLAGS_LONGNAMES) {
-	  return filename;
-  }
   /* reverse search for "/" and return a ptr to the next char */
   for (ptr = filename + strlen(filename) - 1; ptr >= filename; ptr--) {
     if (*ptr == '/') {
@@ -920,7 +923,7 @@ static char *hp_get_base_filename(char *filename) {
  */
 static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
   zend_execute_data *data;
-  char              *func = NULL;
+  const char        *func = NULL;
   const char        *cls = NULL;
   char              *ret = NULL;
   int                len;
@@ -963,7 +966,13 @@ static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
       /* we are dealing with a special directive/function like
        * include, eval, etc.
        */
-#if ZEND_EXTENSION_API_NO >= 220100525
+#if ZEND_EXTENSION_API_NO >= 220121212
+      if (data->prev_execute_data) {
+        curr_op = data->prev_execute_data->opline->extended_value;
+      } else {
+        curr_op = data->opline->extended_value;
+      }
+#elif ZEND_EXTENSION_API_NO >= 220100525
       curr_op = data->opline->extended_value;
 #else
       curr_op = data->opline->op2.u.constant.value.lval;
@@ -999,7 +1008,7 @@ static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
        * you'll see something like "run_init::foo.php" in your reports.
        */
       if (add_filename){
-        char *filename;
+        const char *filename;
         int   len;
         filename = hp_get_base_filename((curr_func->op_array).filename);
         len      = strlen("run_init") + strlen(filename) + 3;
@@ -1137,9 +1146,9 @@ void hp_trunc_time(struct timeval *tv,
   time_in_micro /= intr;
   time_in_micro *= intr;
 
-  /* Update tv Note(bcarl): added explicit typecasting (long) warning C4244 */
-  tv->tv_sec  = (long)(time_in_micro / 1000000);
-  tv->tv_usec = (long)(time_in_micro % 1000000);
+  /* Update tv */
+  tv->tv_sec  = (time_in_micro / 1000000);
+  tv->tv_usec = (time_in_micro % 1000000);
 }
 
 /**
@@ -1220,21 +1229,10 @@ void hp_sample_check(hp_entry_t **entries  TSRMLS_DC) {
  * @return 64 bit unsigned integer
  * @author cjiang
  */
-inline uint64 cycle_timer() {
+static inline uint64 cycle_timer() {
   uint32 __a,__d;
   uint64 val;
-
-#ifdef PHP_WIN32
-  __asm {
-    cpuid
-	rdtsc
-    mov __a, eax
-    mov __d, edx
-  }
-#else
   asm volatile("rdtsc" : "=a" (__a), "=d" (__d));
-#endif
-
   (val) = ((uint64)__a) | (((uint64)__d)<<32);
   return val;
 }
@@ -1279,8 +1277,8 @@ static long get_us_interval(struct timeval *start, struct timeval *end) {
  */
 static void incr_us_interval(struct timeval *start, uint64 incr) {
   incr += (start->tv_sec * 1000000 + start->tv_usec);
-  start->tv_sec  = (long)(incr/1000000);
-  start->tv_usec = (long)(incr%1000000);
+  start->tv_sec  = incr/1000000;
+  start->tv_usec = incr%1000000;
   return;
 }
 
@@ -1293,7 +1291,7 @@ static void incr_us_interval(struct timeval *start, uint64 incr) {
  *
  * @author cjiang
  */
-inline double get_us_from_tsc(uint64 count, double cpu_frequency) {
+static inline double get_us_from_tsc(uint64 count, double cpu_frequency) {
   return count / cpu_frequency;
 }
 
@@ -1306,7 +1304,7 @@ inline double get_us_from_tsc(uint64 count, double cpu_frequency) {
  *
  * @author veeve
  */
-inline uint64 get_tsc_from_us(uint64 usecs, double cpu_frequency) {
+static inline uint64 get_tsc_from_us(uint64 usecs, double cpu_frequency) {
   return (uint64) (usecs * cpu_frequency);
 }
 
@@ -1320,16 +1318,12 @@ inline uint64 get_tsc_from_us(uint64 usecs, double cpu_frequency) {
 static double get_cpu_frequency() {
   struct timeval start;
   struct timeval end;
-  uint64 tsc_start;
-  uint64 tsc_end;
 
   if (gettimeofday(&start, 0)) {
     perror("gettimeofday");
     return 0.0;
   }
-  
-  tsc_start = cycle_timer();
-
+  uint64 tsc_start = cycle_timer();
   /* Sleep for 5 miliseconds. Comparaing with gettimeofday's  few microseconds
    * execution time, this should be enough. */
   usleep(5000);
@@ -1337,9 +1331,7 @@ static double get_cpu_frequency() {
     perror("gettimeofday");
     return 0.0;
   }
-  
-  tsc_end = cycle_timer();
-
+  uint64 tsc_end = cycle_timer();
   return (tsc_end - tsc_start) * 1.0 / (get_us_interval(&start, &end));
 }
 
@@ -1349,7 +1341,7 @@ static double get_cpu_frequency() {
  * @author cjiang
  */
 static void get_all_cpu_frequencies() {
-  uint32 id;
+  int id;
   double frequency;
 
   hp_globals.cpu_frequencies = malloc(sizeof(double) * hp_globals.cpu_num);
@@ -1360,13 +1352,21 @@ static void get_all_cpu_frequencies() {
   /* Iterate over all cpus found on the machine. */
   for (id = 0; id < hp_globals.cpu_num; ++id) {
     /* Only get the previous cpu affinity mask for the first call. */
-    bind_to_cpu(id);
+    if (bind_to_cpu(id)) {
+      clear_frequencies();
+      return;
+    }
 
     /* Make sure the current process gets scheduled to the target cpu. This
      * might not be necessary though. */
     usleep(0);
 
-    hp_globals.cpu_frequencies[id] = get_cpu_frequency();
+    frequency = get_cpu_frequency();
+    if (frequency == 0.0) {
+      clear_frequencies();
+      return;
+    }
+    hp_globals.cpu_frequencies[id] = frequency;
   }
 }
 
@@ -1487,12 +1487,6 @@ void hp_mode_sampled_init_cb(TSRMLS_D) {
   uint64 truncated_tsc;
   double cpu_freq = hp_globals.cpu_frequencies[hp_globals.cur_cpu_id];
 
-  if (cpu_freq == 0.0) {
-    /* There is an insignificant chance that cpu_freq equals 0 
-       and we cannot do anything in this case */
-    return;
-  }
-  
   /* Init the last_sample in tsc */
   hp_globals.last_sample_tsc = cycle_timer();
 
@@ -1583,7 +1577,7 @@ zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
   /* Bump stats in the counts hashtable */
   hp_inc_count(counts, "ct", 1  TSRMLS_CC);
 
-  hp_inc_count(counts, "wt", (long)get_us_from_tsc(tsc_end - top->tsc_start,
+  hp_inc_count(counts, "wt", get_us_from_tsc(tsc_end - top->tsc_start,
         hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) TSRMLS_CC);
   return counts;
 }
@@ -1655,18 +1649,31 @@ void hp_mode_sampled_endfn_cb(hp_entry_t **entries  TSRMLS_DC) {
  *
  * @author hzhao, kannan
  */
+#if PHP_VERSION_ID < 50500
 ZEND_DLEXPORT void hp_execute (zend_op_array *ops TSRMLS_DC) {
+#else
+ZEND_DLEXPORT void hp_execute_ex (zend_execute_data *execute_data TSRMLS_DC) {
+  zend_op_array *ops = execute_data->op_array;
+#endif
   char          *func = NULL;
   int hp_profile_flag = 1;
 
   func = hp_get_function_name(ops TSRMLS_CC);
   if (!func) {
+#if PHP_VERSION_ID < 50500
     _zend_execute(ops TSRMLS_CC);
+#else
+    _zend_execute_ex(execute_data TSRMLS_CC);
+#endif
     return;
   }
 
   BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+#if PHP_VERSION_ID < 50500
   _zend_execute(ops TSRMLS_CC);
+#else
+  _zend_execute_ex(execute_data TSRMLS_CC);
+#endif
   if (hp_globals.entries) {
     END_PROFILING(&hp_globals.entries, hp_profile_flag);
   }
@@ -1675,7 +1682,6 @@ ZEND_DLEXPORT void hp_execute (zend_op_array *ops TSRMLS_DC) {
 
 #undef EX
 #define EX(element) ((execute_data)->element)
-#define EX_T(offset) (*(temp_variable *)((char *) EX(Ts) + offset))
 
 /**
  * Very similar to hp_execute. Proxy for zend_execute_internal().
@@ -1683,8 +1689,18 @@ ZEND_DLEXPORT void hp_execute (zend_op_array *ops TSRMLS_DC) {
  *
  * @author hzhao, kannan
  */
+
+#if PHP_VERSION_ID < 50500
+#define EX_T(offset) (*(temp_variable *)((char *) EX(Ts) + offset))
+
 ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
                                        int ret TSRMLS_DC) {
+#else
+#define EX_T(offset) (*EX_TMP_VAR(execute_data, offset))
+
+ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
+                                       struct _zend_fcall_info *fci, int ret TSRMLS_DC) {
+#endif
   zend_execute_data *current_data;
   char             *func = NULL;
   int    hp_profile_flag = 1;
@@ -1698,8 +1714,30 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
 
   if (!_zend_execute_internal) {
     /* no old override to begin with. so invoke the builtin's implementation  */
+
+#if ZEND_EXTENSION_API_NO >= 220121212
+    /* PHP 5.5. This is just inlining a copy of execute_internal(). */
+
+    if (fci != NULL) {
+      ((zend_internal_function *) execute_data->function_state.function)->handler(
+        fci->param_count,
+        *fci->retval_ptr_ptr,
+        fci->retval_ptr_ptr,
+        fci->object_ptr,
+        1 TSRMLS_CC);
+    } else {
+      zval **return_value_ptr = &EX_TMP_VAR(execute_data, execute_data->opline->result.var)->var.ptr;
+      ((zend_internal_function *) execute_data->function_state.function)->handler(
+        execute_data->opline->extended_value,
+        *return_value_ptr,
+        (execute_data->function_state.function->common.fn_flags & ZEND_ACC_RETURN_REFERENCE)
+          ? return_value_ptr
+          : NULL,
+        execute_data->object,
+        ret TSRMLS_CC);
+    }
+#elif ZEND_EXTENSION_API_NO >= 220100525
     zend_op *opline = EX(opline);
-#if ZEND_EXTENSION_API_NO >= 220100525
     temp_variable *retvar = &EX_T(opline->result.var);
     ((zend_internal_function *) EX(function_state).function)->handler(
                        opline->extended_value,
@@ -1708,6 +1746,7 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
                        &retvar->var.ptr:NULL,
                        EX(object), ret TSRMLS_CC);
 #else
+    zend_op *opline = EX(opline);
     ((zend_internal_function *) EX(function_state).function)->handler(
                        opline->extended_value,
                        EX_T(opline->result.u.var).var.ptr,
@@ -1717,7 +1756,11 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
 #endif
   } else {
     /* call the old override */
+#if PHP_VERSION_ID < 50500
     _zend_execute_internal(execute_data, ret TSRMLS_CC);
+#else
+    _zend_execute_internal(execute_data, fci, ret TSRMLS_CC);
+#endif
   }
 
   if (func) {
@@ -1737,7 +1780,7 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
 ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle,
                                              int type TSRMLS_DC) {
 
-  char           *filename;
+  const char     *filename;
   char           *func;
   int             len;
   zend_op_array  *ret;
@@ -1758,6 +1801,29 @@ ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle,
   return ret;
 }
 
+/**
+ * Proxy for zend_compile_string(). Used to profile PHP eval compilation time.
+ */
+ZEND_DLEXPORT zend_op_array* hp_compile_string(zval *source_string, char *filename TSRMLS_DC) {
+
+    char          *func;
+    int            len;
+    zend_op_array *ret;
+    int            hp_profile_flag = 1;
+
+    len  = strlen("eval") + strlen(filename) + 3;
+    func = (char *)emalloc(len);
+    snprintf(func, len, "eval::%s", filename);
+
+    BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+    ret = _zend_compile_string(source_string, filename TSRMLS_CC);
+    if (hp_globals.entries) {
+        END_PROFILING(&hp_globals.entries, hp_profile_flag);
+    }
+
+    efree(func);
+    return ret;
+}
 
 /**
  * **************************
@@ -1781,9 +1847,18 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
     _zend_compile_file = zend_compile_file;
     zend_compile_file  = hp_compile_file;
 
+    /* Replace zend_compile_string with our proxy */
+    _zend_compile_string = zend_compile_string;
+    zend_compile_string = hp_compile_string;
+
     /* Replace zend_execute with our proxy */
+#if PHP_VERSION_ID < 50500
     _zend_execute = zend_execute;
     zend_execute  = hp_execute;
+#else
+    _zend_execute_ex = zend_execute_ex;
+    zend_execute_ex  = hp_execute_ex;
+#endif
 
     /* Replace zend_execute_internal with our proxy */
     _zend_execute_internal = zend_execute_internal;
@@ -1854,9 +1929,14 @@ static void hp_stop(TSRMLS_D) {
   }
 
   /* Remove proxies, restore the originals */
+#if PHP_VERSION_ID < 50500
   zend_execute          = _zend_execute;
+#else
+  zend_execute_ex       = _zend_execute_ex;
+#endif
   zend_execute_internal = _zend_execute_internal;
   zend_compile_file     = _zend_compile_file;
+  zend_compile_string   = _zend_compile_string;
 
   /* Resore cpu affinity. */
   restore_cpu_affinity(&hp_globals.prev_mask);
@@ -1970,4 +2050,3 @@ static inline void hp_array_del(char **name_array) {
     efree(name_array);
   }
 }
-
