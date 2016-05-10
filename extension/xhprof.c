@@ -596,6 +596,11 @@ static inline uint8 hp_inline_hash(char * str) {
  * @author mpal
  */
 static void hp_get_ignored_functions_from_arg(zval *args) {
+
+  if (hp_globals.ignored_function_names) {
+    hp_array_del(hp_globals.ignored_function_names);
+  }
+
   if (args != NULL) {
     zval  *zresult = NULL;
 
@@ -961,7 +966,13 @@ static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
       /* we are dealing with a special directive/function like
        * include, eval, etc.
        */
-#if ZEND_EXTENSION_API_NO >= 220100525
+#if ZEND_EXTENSION_API_NO >= 220121212
+      if (data->prev_execute_data) {
+        curr_op = data->prev_execute_data->opline->extended_value;
+      } else {
+        curr_op = data->opline->extended_value;
+      }
+#elif ZEND_EXTENSION_API_NO >= 220100525
       curr_op = data->opline->extended_value;
 #else
       curr_op = data->opline->op2.u.constant.value.lval;
@@ -1703,15 +1714,27 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
 
   if (!_zend_execute_internal) {
     /* no old override to begin with. so invoke the builtin's implementation  */
+
 #if ZEND_EXTENSION_API_NO >= 220121212
+    /* PHP 5.5. This is just inlining a copy of execute_internal(). */
+
     if (fci != NULL) {
-      ((zend_internal_function *) execute_data->function_state.function)->handler(fci->param_count,
-                       *fci->retval_ptr_ptr, fci->retval_ptr_ptr, fci->object_ptr, 1 TSRMLS_CC);
+      ((zend_internal_function *) execute_data->function_state.function)->handler(
+        fci->param_count,
+        *fci->retval_ptr_ptr,
+        fci->retval_ptr_ptr,
+        fci->object_ptr,
+        1 TSRMLS_CC);
     } else {
       zval **return_value_ptr = &EX_TMP_VAR(execute_data, execute_data->opline->result.var)->var.ptr;
-      ((zend_internal_function *) execute_data->function_state.function)->handler(execute_data->opline->extended_value, *return_value_ptr,
-                       (execute_data->function_state.function->common.fn_flags & ZEND_ACC_RETURN_REFERENCE)?return_value_ptr:NULL,
-                       execute_data->object, ret TSRMLS_CC);
+      ((zend_internal_function *) execute_data->function_state.function)->handler(
+        execute_data->opline->extended_value,
+        *return_value_ptr,
+        (execute_data->function_state.function->common.fn_flags & ZEND_ACC_RETURN_REFERENCE)
+          ? return_value_ptr
+          : NULL,
+        execute_data->object,
+        ret TSRMLS_CC);
     }
 #elif ZEND_EXTENSION_API_NO >= 220100525
     zend_op *opline = EX(opline);
@@ -2027,4 +2050,3 @@ static inline void hp_array_del(char **name_array) {
     efree(name_array);
   }
 }
-
