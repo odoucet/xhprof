@@ -1464,12 +1464,15 @@ void hp_mode_hier_endfn_cb(hp_entry_t **entries  TSRMLS_DC) {
 ZEND_DLEXPORT void hp_execute_ex (zend_execute_data *execute_data TSRMLS_DC) {
   zend_string   *func = NULL;
   int hp_profile_flag = 1;
+  
+  zend_class_entry *called_scope;
+  called_scope = zend_get_called_scope(execute_data);
 
   func = execute_data->func->internal_function.function_name;
   /* check if was in a class */ 
-  if (execute_data ->called_scope != NULL && func != NULL) {
+  if (called_scope != NULL && func != NULL) {
   	//this is a class method;
-	zend_string *class_name = execute_data->called_scope->name;
+	zend_string *class_name = called_scope->name;
 	zend_string *func_name = func;
 
 	int class_name_len = class_name->len;
