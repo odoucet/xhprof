@@ -1539,7 +1539,7 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data, zval *re
 	  func = zend_string_init(class_name->val, class_name_len + 2 + func_name->len, 0); 
 	  memcpy(func->val + class_name_len, "::", 2);
 	  memcpy(func->val + class_name_len + 2, func_name->val, func_name->len);
-  } else {
+  } else if (func) {
 	  //just do the copy;
 	  func = zend_string_init(func->val, func->len, 0);
   }
